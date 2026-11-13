@@ -1,0 +1,36 @@
+name: keepalive
+
+# odoo.sh puts a staging / dev build to sleep after ~3 minutes without a request, and a sleeping build runs no cron.
+# GitHub's scheduler cannot go below 5 minutes, so each run loops itself (one request per minute) for ~5h55.
+# A new run starts every 5 hours: runs overlap by about 1 hour, so there is never a gap.
+on:
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    # Flag read when the run starts: to stop, disable the workflow and cancel the running runs (see README)
+    if: ${{ vars.KEEPALIVE_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - name: Ping /web/health every minute
+        env:
+          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
+        run: |
+          if [ -z "$KEEPALIVE_URL" ]; then
+            echo "::error::Secret KEEPALIVE_URL is not set"
+            exit 1
+          fi
+          url="${KEEPALIVE_URL%/}/web/health"
+          failures=0
+          while [ "$SECONDS" -lt 21300 ]; do
+            if [ "$(curl -sS -o /dev/null -m 30 -w '%{http_code}' "$url" 2>/dev/null)" = "200" ]; then
+              failures=0
+            else
+              failures=$((failures + 1))
+              echo "::warning::health check failed ($failures in a row) at $(date -u '+%F %T') UTC"
+            fi
+            sleep 60
+          done
