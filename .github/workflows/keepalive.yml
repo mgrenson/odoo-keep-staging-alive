@@ -1,36 +1,63 @@
 name: keepalive
 
 # odoo.sh puts a staging / dev build to sleep after ~3 minutes without a request, and a sleeping build runs no cron.
-# GitHub's scheduler cannot go below 5 minutes, so each run loops itself (one request per minute) for ~5h55.
-# A new run starts every 5 hours: runs overlap by about 1 hour, so there is never a gap.
+# GitHub's scheduler cannot go below 5 minutes and may delay or skip a scheduled run by hours, so:
+# - each run loops by itself (one request per minute) for ~5h50, and starts the next run itself ~10 min before ending;
+# - the schedule is only a safety net: it starts a new chain when no run is looping (first start, failed relay...).
 on:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
+
+permissions:
+  actions: write  # to start the next run (a workflow_dispatch sent with GITHUB_TOKEN does start a new run)
 
 jobs:
   keepalive:
-    # Flag read when the run starts: to stop, disable the workflow and cancel the running runs (see README)
+    # Checked when a run starts: set the flag to anything else than 'true' and the chain stops with the current run
     if: ${{ vars.KEEPALIVE_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 358
     steps:
-      - name: Ping /web/health every minute
+      - name: Ping /web/health every minute, then start the next run
         env:
           KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           if [ -z "$KEEPALIVE_URL" ]; then
             echo "::error::Secret KEEPALIVE_URL is not set"
             exit 1
           fi
+          if [ "$EVENT" = "schedule" ]; then
+            others=$(gh run list --workflow keepalive.yml --status in_progress --json databaseId \
+              --jq "[.[] | select(.databaseId != $RUN_ID)] | length")
+            if [ "$others" != "0" ]; then
+              echo "Another run is already looping, nothing to do."
+              exit 0
+            fi
+            echo "::notice::No run was looping: this scheduled run starts a new chain"
+          fi
           url="${KEEPALIVE_URL%/}/web/health"
           failures=0
-          while [ "$SECONDS" -lt 21300 ]; do
+          relayed=0
+          # loop ~350 min (GitHub's job limit is 360 min), start the next run at ~340 min: runs overlap ~10 min
+          while [ "$SECONDS" -lt 21000 ]; do
             if [ "$(curl -sS -o /dev/null -m 30 -w '%{http_code}' "$url" 2>/dev/null)" = "200" ]; then
               failures=0
             else
               failures=$((failures + 1))
               echo "::warning::health check failed ($failures in a row) at $(date -u '+%F %T') UTC"
+            fi
+            if [ "$relayed" = "0" ] && [ "$SECONDS" -ge 20400 ]; then
+              if gh workflow run keepalive.yml --ref "$GITHUB_REF_NAME"; then
+                echo "Next run started at $(date -u '+%F %T') UTC"
+              else
+                echo "::warning::could not start the next run, the schedule takes over within 30 minutes"
+              fi
+              relayed=1
             fi
             sleep 60
           done

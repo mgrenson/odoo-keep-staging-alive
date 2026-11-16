@@ -7,16 +7,19 @@ odoo.sh puts a build to sleep after ~3 minutes without a request, and a sleeping
 
 ## How it works
 
-- GitHub's scheduler cannot go below 5 minutes, so each run loops by itself: one request per minute for ~5h55
-  (`SECONDS < 21300`, job timeout 358 min, under GitHub's 6 h limit).
-- A new run is scheduled every 5 hours (`0 */5 * * *`): runs overlap by about 1 hour, so a delayed or skipped
-  schedule does not leave a gap.
+- GitHub's scheduler cannot go below 5 minutes, so each run loops by itself: one request per minute for ~5h50
+  (`SECONDS < 21000`, job timeout 358 min, under GitHub's 6 h limit).
+- Each run starts the next one itself (`gh workflow run`, at ~5h40), so runs overlap ~10 minutes. The relay does not
+  depend on GitHub's scheduler, which may delay a scheduled run by hours or skip it.
+- The schedule (`*/30 * * * *`) is only a safety net: a scheduled run exits at once when another run is looping, and
+  otherwise starts a new chain (first start, relay that failed, run cancelled by mistake). Worst case: ~30 minutes
+  without request, so the build may sleep for that time.
 - Configuration lives in your fork, not in the code:
   - secret `KEEPALIVE_URL`: base URL of the build, without `/web/health` (e.g. `https://<build>.dev.odoo.com`)
-  - variable `KEEPALIVE_ENABLED`: `true` to allow runs, anything else to skip them
+  - variable `KEEPALIVE_ENABLED`: `true` to allow runs, anything else to skip them (checked when a run starts)
 - Cost: public repository = free and unlimited with standard GitHub-hosted runners. On a private repository, a run is
-  billed ~1.2 minutes per elapsed minute (about 1 700 minutes per day of keepalive), against a free quota of
-  2 000 minutes per month on a Free plan.
+  billed about 1 minute per elapsed minute (about 1 500 minutes per day of keepalive, plus 1 minute per scheduled run
+  that exits at once, about 50 per day), against a free quota of 2 000 minutes per month on a Free plan.
 
 ## Setup
 
@@ -31,7 +34,7 @@ odoo.sh puts a build to sleep after ~3 minutes without a request, and a sleeping
    gh variable set KEEPALIVE_ENABLED --body true
    ```
 
-4. Start now instead of waiting for the next scheduled slot:
+4. Start now instead of waiting for the next scheduled slot (up to 30 minutes, or more if GitHub is late):
 
    ```
    gh workflow run keepalive.yml
@@ -45,12 +48,11 @@ rebuild: update the secret (`gh secret set KEEPALIVE_URL`).
 
 ## Stop
 
-The flag is read when a run starts, so setting it to `false` does not end a run already looping. To stop completely:
-
 ```
 gh variable set KEEPALIVE_ENABLED --body false
-gh workflow disable keepalive.yml
 gh run list --workflow keepalive.yml --status in_progress   # then: gh run cancel <id>
 ```
 
-Re-enable with `gh workflow enable keepalive.yml` and the flag back to `true`.
+With the flag at `false`, no new run starts (neither the relay nor the schedule), so the chain ends with the run in
+progress; cancel it to stop at once. To also drop the scheduled runs from the Actions tab:
+`gh workflow disable keepalive.yml` (re-enable with `gh workflow enable keepalive.yml`).
